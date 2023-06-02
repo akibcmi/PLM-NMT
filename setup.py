@@ -5,26 +5,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-import subprocess
 import sys
 
 from setuptools import Extension, find_packages, setup
 
+
 if sys.version_info < (3, 6):
     sys.exit("Sorry, Python >= 3.6 is required for fairseq.")
-
-
-def write_version_py():
-    with open(os.path.join("fairseq", "version.txt")) as f:
-        version = f.read().strip()
-
-    # write version info to fairseq/version.py
-    with open(os.path.join("fairseq", "version.py"), "w") as f:
-        f.write('__version__ = "{}"\n'.format(version))
-    return version
-
-
-version = write_version_py()
 
 
 with open("README.md") as f:
@@ -89,30 +76,14 @@ try:
     extensions.extend(
         [
             cpp_extension.CppExtension(
-                "fairseq.libbase",
+                "fairseq.libnat",
                 sources=[
-                    "fairseq/clib/libbase/balanced_assignment.cpp",
+                    "fairseq/clib/libnat/edit_dist.cpp",
                 ],
             )
         ]
     )
 
-    extensions.extend(
-        [
-            cpp_extension.CppExtension(
-                "fairseq.libnat",
-                sources=[
-                    "fairseq/clib/libnat/edit_dist.cpp",
-                ],
-            ),
-            cpp_extension.CppExtension(
-                "alignment_train_cpu_binding",
-                sources=[
-                    "examples/operators/alignment_train_cpu.cpp",
-                ],
-            ),
-        ]
-    )
     if "CUDA_HOME" in os.environ:
         extensions.extend(
             [
@@ -122,21 +93,7 @@ try:
                         "fairseq/clib/libnat_cuda/edit_dist.cu",
                         "fairseq/clib/libnat_cuda/binding.cpp",
                     ],
-                ),
-                cpp_extension.CppExtension(
-                    "fairseq.ngram_repeat_block_cuda",
-                    sources=[
-                        "fairseq/clib/cuda/ngram_repeat_block_cuda.cpp",
-                        "fairseq/clib/cuda/ngram_repeat_block_cuda_kernel.cu",
-                    ],
-                ),
-                cpp_extension.CppExtension(
-                    "alignment_train_cuda_binding",
-                    sources=[
-                        "examples/operators/alignment_train_kernel.cu",
-                        "examples/operators/alignment_train_cuda.cpp",
-                    ],
-                ),
+                )
             ]
         )
     cmdclass["build_ext"] = cpp_extension.BuildExtension
@@ -162,6 +119,7 @@ else:
 if "clean" in sys.argv[1:]:
     # Source: https://bit.ly/2NLVsgE
     print("deleting Cython files...")
+    import subprocess
 
     subprocess.run(
         ["rm -f fairseq/*.so fairseq/**/*.so fairseq/*.pyd fairseq/**/*.pyd"],
@@ -177,39 +135,32 @@ if os.path.exists(os.path.join("fairseq", "model_parallel", "megatron", "mpu")):
 def do_setup(package_data):
     setup(
         name="fairseq",
-        version=version,
+        version="0.10.2",
         description="Facebook AI Research Sequence-to-Sequence Toolkit",
         url="https://github.com/pytorch/fairseq",
         classifiers=[
             "Intended Audience :: Science/Research",
             "License :: OSI Approved :: MIT License",
             "Programming Language :: Python :: 3.6",
-            "Programming Language :: Python :: 3.7",
-            "Programming Language :: Python :: 3.8",
             "Topic :: Scientific/Engineering :: Artificial Intelligence",
         ],
         long_description=readme,
         long_description_content_type="text/markdown",
         setup_requires=[
             "cython",
-            'numpy<1.20.0; python_version<"3.7"',
-            'numpy; python_version>="3.7"',
+            "numpy",
             "setuptools>=18.0",
         ],
         install_requires=[
             "cffi",
             "cython",
-            'dataclasses; python_version<"3.7"',
-            "hydra-core>=1.0.7,<1.1",
-            "omegaconf<2.1",
-            'numpy<1.20.0; python_version<"3.7"',
-            'numpy; python_version>="3.7"',
+            "dataclasses",
+            "hydra-core",
+            "numpy",
             "regex",
             "sacrebleu>=1.4.12",
             "torch",
             "tqdm",
-            "bitarray",
-            "torchaudio>=0.8.0",
         ],
         dependency_links=dependency_links,
         packages=find_packages(
@@ -221,8 +172,7 @@ def do_setup(package_data):
                 "tests",
                 "tests.*",
             ]
-        )
-        + extra_packages,
+        ) + extra_packages,
         package_data=package_data,
         ext_modules=extensions,
         test_suite="tests",
@@ -230,7 +180,6 @@ def do_setup(package_data):
             "console_scripts": [
                 "fairseq-eval-lm = fairseq_cli.eval_lm:cli_main",
                 "fairseq-generate = fairseq_cli.generate:cli_main",
-                "fairseq-hydra-train = fairseq_cli.hydra_train:cli_main",
                 "fairseq-interactive = fairseq_cli.interactive:cli_main",
                 "fairseq-preprocess = fairseq_cli.preprocess:cli_main",
                 "fairseq-score = fairseq_cli.score:cli_main",
@@ -254,20 +203,15 @@ def get_files(path, relative_to="fairseq"):
     return all_files
 
 
-if __name__ == "__main__":
-    try:
-        # symlink examples into fairseq package so package_data accepts them
-        fairseq_examples = os.path.join("fairseq", "examples")
-        if "build_ext" not in sys.argv[1:] and not os.path.exists(fairseq_examples):
-            os.symlink(os.path.join("..", "examples"), fairseq_examples)
-
-        package_data = {
-            "fairseq": (
-                get_files(fairseq_examples)
-                + get_files(os.path.join("fairseq", "config"))
-            )
-        }
-        do_setup(package_data)
-    finally:
-        if "build_ext" not in sys.argv[1:] and os.path.islink(fairseq_examples):
-            os.unlink(fairseq_examples)
+try:
+    # symlink examples into fairseq package so package_data accepts them
+    fairseq_examples = os.path.join("fairseq", "examples")
+    if "build_ext" not in sys.argv[1:] and not os.path.exists(fairseq_examples):
+        os.symlink(os.path.join("..", "examples"), fairseq_examples)
+    package_data = {
+        "fairseq": get_files("fairseq/config") + get_files("fairseq/examples"),
+    }
+    do_setup(package_data)
+finally:
+    if "build_ext" not in sys.argv[1:] and os.path.exists(fairseq_examples):
+        os.unlink(fairseq_examples)
