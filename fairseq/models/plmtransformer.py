@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from transformers import AutoConfig
 from transformers import BertPreTrainedModel
 from transformers import BertForMaskedLM
+from transformers import DataCollatorForLanguageModeling
 
 import torch
 import torch.nn as nn
@@ -171,6 +172,12 @@ class PLMTransformerModel(FairseqEncoderDecoderModel):
                             help='the dropout for self-attention', default=0.1)
         parser.add_argument("--adropout-tplm", type=float, metavar='D',
                             help='the dropout for self-attention', default=0.1)
+        parser.add_argument("--random-splm", action="store_true", metavar='N', )
+        parser.add_argument("--random-tplm", action="store_true", metavar='N', )
+
+
+        parser.add_argument("--layer-number-coordinator", type=int, default=6, metavar='D' )
+        parser.add_argument("--dropout-coord", type=float, default=0.1, metavar='D')
         # fmt: on
 
     @classmethod
@@ -314,11 +321,24 @@ class PLMTransformerEncoder(FairseqEncoder):
         self.plmconfig = AutoConfig.from_pretrained(args.source_plm)
         self.plmconfig.attention_probs_dropout_prob = args.adropout_splm
         self.plmconfig.hidden_dropout_prob = args.dropout_splm
-        self.plmencoder = BertPreTrainedModel.from_pretrained(args.source_plm, config=self.plmconfig)
+        self.plmencoder = BertForMaskedLM.from_pretrained(args.source_plm, config=self.plmconfig)
 
         self.half_layer_kd = args.half_layer_kd
         self.mlmprob = args.smlmprob
-        self.
+        self.layer_splm = args.layer_number_splm
+
+        self.sig = nn.Sequential(nn.Linear(self.plmconfig.hidden_size * 2, self.plmconfig.hidden_size)
+                                 , nn.Sigmoid()
+        )
+
+        if self.mlmprob > 0:
+            self.data_fn = DataCollatorForLanguageModeling(
+                tokenizer=dictionary.bert2 if dictionary.bert2 is not None else dictionary.bert,
+                mlm_probability=args.smlmpro)
+        if self.half_layer_kd:
+            self.teacher_bert = BertForMaskedLM.from_pretrained(args.source_bert,config=self.plmconfig)
+            self.teacher_bert.eval()
+            self.teacher_bert.requires_grad_(False)
 
         self.dropout_module = FairseqDropout(
             args.dropout, module_name=self.__class__.__name__
@@ -421,34 +441,54 @@ class PLMTransformerEncoder(FairseqEncoder):
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
-        x, encoder_embedding = self.forward_embedding(src_tokens, token_embeddings)
+        bert_encoder_padding_mask = src_tokens.ne(self.dictionary.pad_index)
+        kd_loss=None
+        mlmloss= None
+        if self.training and self.mlmprob > 0:
+            if self.dictionary.embed is not None:
+                input_ids, labels = self.data_fn.torch_mask_tokens_dic(src_tokens, self.dictionary, special_tokens_mask=None)
+            else:
+                input_ids, labels = self.data_fn.torch_mask_tokens(src_tokens, special_tokens_mask=None)
+            bert_mlm_out = self.plmencoder(input_ids, attention_mask=bert_encoder_padding_mask,
+                                           output_hidden_states=True,
+                                           labels=labels,
+                                           limit=self.layer_splm)
+            mlmloss = bert_mlm_out.loss
 
-        # B x T x C -> T x B x C
-        x = x.transpose(0, 1)
+        plm_encoder_out = self.plmencoder.bert(src_tokens,
+                                               attention_mask=bert_encoder_padding_mask,
+                                               output_hidden_states=True,
+                                               limit=self.layer_splm)
+        x = plm_encoder_out.hidden_states[-1]
+        sig = self.sig(torch.cat([x, plm_encoder_out.hidden_states[6]],-1))
+        x = sig * x + (1-sig) * plm_encoder_out.hidden_states[6]
+        x = x.transpose(0,1)
 
-        # compute padding mask
-        encoder_padding_mask = src_tokens.eq(self.padding_idx)
+        plmout = []
+        for j in plm_encoder_out.hidden_states:
+            plmout.append(j.transpose(0,1))
+        plm_encoder_out.hidden_states = plmout
 
-        encoder_states = [] if return_all_hiddens else None
+        if self.half_layer_kd:
+            teacher_out = self.teacher_bert.bert(src_tokens,
+                                                 attention_mask=bert_encoder_padding_mask,
+                                                 output_hidden_states=True)
+            criterion=nn.MSELoss()
 
-        # encoder layers
-        for layer in self.layers:
-            x = layer(x, encoder_padding_mask)
-            if return_all_hiddens:
-                assert encoder_states is not None
-                encoder_states.append(x)
 
-        if self.layer_norm is not None:
-            x = self.layer_norm(x)
+            kd_loss = criterion(plm_encoder_out.hidden_states[6],teacher_out.hidden_states[-1])
 
         return EncoderOut(
             encoder_out=x,  # T x B x C
-            encoder_padding_mask=encoder_padding_mask,  # B x T
-            encoder_embedding=encoder_embedding,  # B x T x C
-            encoder_states=encoder_states,  # List[T x B x C]
+            encoder_padding_mask=bert_encoder_padding_mask,  # B x T
+            encoder_embedding=plm_encoder_out.hidden_states[0].transpose(1, 0),  # B x T x C
+            encoder_states=plm_encoder_out.hidden_states,  # List[T x B x C]
             src_tokens=None,
             src_lengths=None,
+            mlmloss=mlmloss,
+            kd_loss=kd_loss
         )
+
 
     @torch.jit.export
     def reorder_encoder_out(self, encoder_out: EncoderOut, new_order):
@@ -509,6 +549,8 @@ class PLMTransformerEncoder(FairseqEncoder):
 
     def max_positions(self):
         """Maximum input length supported by the encoder."""
+        if self.plmencoder is not None and self.dictionary.bert is not None:
+            return self.dictionary.bert.model_max_length
         if self.embed_positions is None:
             return self.max_source_positions
         return min(self.max_source_positions, self.embed_positions.max_positions)
@@ -556,6 +598,26 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         super().__init__(dictionary)
         self.register_buffer("version", torch.Tensor([3]))
         self._future_mask = torch.empty(0)
+
+        self.plmconfig = AutoConfig.from_pretrained(args.target_plm)
+        self.plmconfig.attention_probs_dropout_prob = args.adropout_tplm
+        self.plmconfig.hidden_dropout_prob = args.dropout_tplm
+        self.plmdecoder = BertForMaskedLM.from_pretrained(args.target_plm, config=self.plmconfig)
+
+        self.mlmprob = args.smlmprob
+        self.layer_tplm = args.layer_number_tplm
+        self.layer_coordinator = args.layer_number_coordinator
+        self.dropout_coord = FairseqDropout(
+            args.dropout_coord, module_name=self.__class__.__name__
+        )
+        self.bert_size = self.plmconfig.hidden_size
+
+        self.sig = nn.Sequential(nn.Linear(self.bert_size *2, self.bert_size),
+                                 nn.Sigmoid()
+        )
+        if self.mlmprob > 0:
+            self.data_fn = DataCollatorForLanguageModeling(tokenizer=dictionary.bert,
+                                             mlm_probability=self.mlmprob)
 
         self.dropout_module = FairseqDropout(
             args.dropout, module_name=self.__class__.__name__
