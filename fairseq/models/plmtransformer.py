@@ -31,6 +31,8 @@ from fairseq.modules import (
     SinusoidalPositionalEmbedding,
     TransformerDecoderLayer,
     TransformerEncoderLayer,
+    PLMTransformerDecoderLayer,
+    PLMCoordinatorLayer
 )
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
 from torch import Tensor
@@ -243,11 +245,11 @@ class PLMTransformerModel(FairseqEncoderDecoderModel):
 
     @classmethod
     def build_encoder(cls, args, src_dict, embed_tokens):
-        return TransformerEncoder(args, src_dict, embed_tokens)
+        return PLMTransformerEncoder(args, src_dict, embed_tokens)
 
     @classmethod
     def build_decoder(cls, args, tgt_dict, embed_tokens):
-        return TransformerDecoder(
+        return PLMTransformerDecoder(
             args,
             tgt_dict,
             embed_tokens,
@@ -345,29 +347,7 @@ class PLMTransformerEncoder(FairseqEncoder):
         )
         self.encoder_layerdrop = args.encoder_layerdrop
 
-        embed_dim = embed_tokens.embedding_dim
-        self.padding_idx = embed_tokens.padding_idx
-        self.max_source_positions = args.max_source_positions
-
-        self.embed_tokens = embed_tokens
-
-        self.embed_scale = 1.0 if args.no_scale_embedding else math.sqrt(embed_dim)
-
-        self.embed_positions = (
-            PositionalEmbedding(
-                args.max_source_positions,
-                embed_dim,
-                self.padding_idx,
-                learned=args.encoder_learned_pos,
-            )
-            if not args.no_token_positional_embeddings
-            else None
-        )
-
-        if getattr(args, "layernorm_embedding", False):
-            self.layernorm_embedding = LayerNorm(embed_dim)
-        else:
-            self.layernorm_embedding = None
+        embed_dim = self.plmconfig.hidden_size
 
         if not args.adaptive_input and args.quant_noise_pq > 0:
             self.quant_noise = apply_quant_noise_(
@@ -377,39 +357,6 @@ class PLMTransformerEncoder(FairseqEncoder):
             )
         else:
             self.quant_noise = None
-
-        if self.encoder_layerdrop > 0.0:
-            self.layers = LayerDropModuleList(p=self.encoder_layerdrop)
-        else:
-            self.layers = nn.ModuleList([])
-        self.layers.extend(
-            [self.build_encoder_layer(args) for i in range(args.encoder_layers)]
-        )
-        self.num_layers = len(self.layers)
-
-        if args.encoder_normalize_before:
-            self.layer_norm = LayerNorm(embed_dim)
-        else:
-            self.layer_norm = None
-
-    def build_encoder_layer(self, args):
-        return TransformerEncoderLayer(args)
-
-    def forward_embedding(
-        self, src_tokens, token_embedding: Optional[torch.Tensor] = None
-    ):
-        # embed tokens and positions
-        if token_embedding is None:
-            token_embedding = self.embed_tokens(src_tokens)
-        x = embed = self.embed_scale * token_embedding
-        if self.embed_positions is not None:
-            x = embed + self.embed_positions(src_tokens)
-        if self.layernorm_embedding is not None:
-            x = self.layernorm_embedding(x)
-        x = self.dropout_module(x)
-        if self.quant_noise is not None:
-            x = self.quant_noise(x)
-        return x, embed
 
     def forward(
         self,
@@ -580,7 +527,7 @@ class PLMTransformerEncoder(FairseqEncoder):
         return state_dict
 
 
-class TransformerDecoder(FairseqIncrementalDecoder):
+class PLMTransformerDecoder(FairseqIncrementalDecoder):
     """
     Transformer decoder consisting of *args.decoder_layers* layers. Each layer
     is a :class:`TransformerDecoderLayer`.
@@ -602,7 +549,10 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.plmconfig = AutoConfig.from_pretrained(args.target_plm)
         self.plmconfig.attention_probs_dropout_prob = args.adropout_tplm
         self.plmconfig.hidden_dropout_prob = args.dropout_tplm
+        self.plmconfig.is_decoder = True
+        self.plmconfig.add_cross_attention = False
         self.plmdecoder = BertForMaskedLM.from_pretrained(args.target_plm, config=self.plmconfig)
+        self.dictionary = dictionary
 
         self.mlmprob = args.smlmprob
         self.layer_tplm = args.layer_number_tplm
@@ -622,7 +572,13 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         self.dropout_module = FairseqDropout(
             args.dropout, module_name=self.__class__.__name__
         )
-        self.decoder_layerdrop = args.decoder_layerdrop
+        self.layers = nn.ModuleList([])
+        self.layers.extend(
+            [
+                self.build_coord_layer(args, no_encoder_attn)
+                for _ in range(self.layer_coordinator)
+            ]
+        )
         self.share_input_output_embed = args.share_decoder_input_output_embed
 
         input_embed_dim = embed_tokens.embedding_dim
@@ -670,18 +626,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
         self.cross_self_attention = getattr(args, "cross_self_attention", False)
 
-        if self.decoder_layerdrop > 0.0:
-            self.layers = LayerDropModuleList(p=self.decoder_layerdrop)
-        else:
-            self.layers = nn.ModuleList([])
-        self.layers.extend(
-            [
-                self.build_decoder_layer(args, no_encoder_attn)
-                for _ in range(args.decoder_layers)
-            ]
-        )
-        self.num_layers = len(self.layers)
-
         if args.decoder_normalize_before and not getattr(
             args, "no_decoder_final_norm", False
         ):
@@ -724,6 +668,9 @@ class TransformerDecoder(FairseqIncrementalDecoder):
 
     def build_decoder_layer(self, args, no_encoder_attn=False):
         return TransformerDecoderLayer(args, no_encoder_attn)
+
+    def build_coord_layer(self, args, no_encoder_attn=False):
+        return PLMCoordinatorLayer(args, no_encoder_attn)
 
     def forward(
         self,
@@ -819,70 +766,80 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 - the decoder's features of shape `(batch, tgt_len, embed_dim)`
                 - a dictionary with any model-specific outputs
         """
-        if alignment_layer is None:
-            alignment_layer = self.num_layers - 1
-
-        # embed positions
-        positions = (
-            self.embed_positions(
-                prev_output_tokens, incremental_state=incremental_state
-            )
-            if self.embed_positions is not None
-            else None
-        )
-
+        mlmloss = None
+        prev_token = prev_output_tokens
         if incremental_state is not None:
-            prev_output_tokens = prev_output_tokens[:, -1:]
-            if positions is not None:
-                positions = positions[:, -1:]
+            if "previous_key_value" in incremental_state:
+                previous_key_value = incremental_state["previous_key_value"]
+            else:
+                previous_key_value = None
+        else:
+            previous_key_value = None
+        if incremental_state is None:
+            bert_decoder_padding_mask = prev_output_tokens.ne(self.dictionary.pad_index)
+        else:
+            prev_token = prev_output_tokens
+            prev_output_tokens = prev_output_tokens[:,-1:]
+            bert_decoder_padding_mask = prev_token.ne(self.dictionary.pad_index)
+        if self.training and self.mlmprob > 0:
+            if self.dictionary.embed is not None:
+                input_ids, label = self.data_fn.torch_mask_tokens_dic(prev_output_tokens, self.dictionary,
+                                                                      special_tokens_mask=None)
+            else:
+                input_ids, label = self.data_fn.torch_mask_tokens(prev_output_tokens, special_tokens_mask=None)
+            bert_unimlm_out = self.plmdecoder(input_ids, labels=label, attention_mask=bert_decoder_padding_mask,
+                                              output_hidden_states=True,
+                                              limit=self.tlayer)
+            mlmloss = bert_unimlm_out.loss
+        plm_decoder_out = self.plmdecoder.bert(prev_output_tokens, attention_mask=bert_decoder_padding_mask,
+                                output_hidden_states=True,
+                                limit=self.tlayer,past_key_values=previous_key_value,decoder=True)
+        if incremental_state is not None:
+            incremental_state["previous_key_value"] = plm_decoder_out["past_key_values"]
 
-        # embed tokens and positions
-        x = self.embed_scale * self.embed_tokens(prev_output_tokens)
-
-        if self.quant_noise is not None:
-            x = self.quant_noise(x)
-
-        if self.project_in_dim is not None:
-            x = self.project_in_dim(x)
-
+        x = plm_decoder_out.hidden_states[-1]
+        sigs = self.sig(torch.cat([x, plm_decoder_out.hidden_states[6]],-1))
+        x = sigs * x + (1 - sigs ) * plm_decoder_out.hidden_states[6]
+        x = x.transpose(0,1)
+        positions = self.embed_positions(
+            prev_token,
+            incremental_state=incremental_state,
+        ) if self.embed_positions is not None else None
+        if incremental_state is not None:
+            positions = positions[:,-1:]
         if positions is not None:
-            x += positions
+            x = x + positions
+        encoder_state = encoder_out.encoder_out
 
-        if self.layernorm_embedding is not None:
-            x = self.layernorm_embedding(x)
+        self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
 
-        x = self.dropout_module(x)
-
-        # B x T x C -> T x B x C
-        x = x.transpose(0, 1)
-
-        self_attn_padding_mask: Optional[Tensor] = None
-        if self.cross_self_attention or prev_output_tokens.eq(self.padding_idx).any():
-            self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
-
-        # decoder layers
-        attn: Optional[Tensor] = None
-        inner_states: List[Optional[Tensor]] = [x]
+        inner_states = []
         for idx, layer in enumerate(self.layers):
+            if encoder_out is not None:
+                if self.layer_wise_attention:
+                    encoder_state = encoder_out.encoder_states[idx]
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
             else:
                 self_attn_mask = None
 
-            x, layer_attn, _ = layer(
-                x,
-                encoder_out.encoder_out if encoder_out is not None else None,
-                encoder_out.encoder_padding_mask if encoder_out is not None else None,
+            encoder_padding_mask = encoder_out.encoder_padding_mask if encoder_out is not None else None
+            if encoder_padding_mask is not None:
+                encoder_padding_mask = ~encoder_padding_mask
+
+            x, layer_attn = layer(
+                x, encoder_state,
+                encoder_padding_mask,
                 incremental_state,
                 self_attn_mask=self_attn_mask,
                 self_attn_padding_mask=self_attn_padding_mask,
                 need_attn=bool((idx == alignment_layer)),
                 need_head_weights=bool((idx == alignment_layer)),
+                decoder_out = plm_decoder_out
             )
             inner_states.append(x)
             if layer_attn is not None and idx == alignment_layer:
                 attn = layer_attn.float().to(x)
-
         if attn is not None:
             if alignment_heads is not None:
                 attn = attn[:alignment_heads]
@@ -893,13 +850,17 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         if self.layer_norm is not None:
             x = self.layer_norm(x)
 
-        # T x B x C -> B x T x C
         x = x.transpose(0, 1)
 
         if self.project_out_dim is not None:
             x = self.project_out_dim(x)
 
-        return x, {"attn": [attn], "inner_states": inner_states}
+        if mlmloss is not None and encoder_out.mlmloss is not None:
+            mlmloss = mlmloss + encoder_out.mlmloss
+        elif encoder_out.mlmloss is not None:
+            mlmloss = encoder_out.mlmloss
+
+        return x, {"attn": [attn], "inner_states": inner_states, "mlmloss":mlmloss, "kd_loss":encoder_out.kd_loss}
 
     def output_layer(self, features):
         """Project features to the vocabulary size."""
