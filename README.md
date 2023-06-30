@@ -1,9 +1,17 @@
 # PLM-NMT
 This is the code for ACL Findings Paper Encoder and Decoder, Not One Less for Pre-trained Language Model Sponsored NMT. 
 
-However, I will rewrite our model in Fairseq-0.10.2, which is different from the version I used (Fairseq-0.9.0). All codes will be uploaded soon.
+This code is based on Fairseq 0.10.2.
 
 The version of transformers is 4.29.2.
+
+Usage:
+
+1. python fwet-embed.py
+2. java bpe
+3. python fairseq_cli/preprocess.py
+4. python fairseq_cli/train.py
+5. python fairseq_cli/generate.py
 
 Results of Chinese-English will be uploaded to github and arxiv.
 
