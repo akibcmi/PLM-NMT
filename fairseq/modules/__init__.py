@@ -34,7 +34,7 @@ from .transformer_sentence_encoder import TransformerSentenceEncoder
 from .transpose_last import TransposeLast
 from .unfold import unfold1d
 from .transformer_layer import TransformerDecoderLayer, TransformerEncoderLayer
-from .plmtransformer_layer import PLMTransformerDecoderLayer, PLMCoordinatorLayer
+from .plmtransformer_layer import PLMCoordinatorLayer
 from .vggblock import VGGBlock
 
 __all__ = [

@@ -14,6 +14,8 @@ import sys
 from collections import Counter
 from itertools import zip_longest
 from multiprocessing import Pool
+import transformers
+from transformers import BertTokenizer
 
 from fairseq import options, tasks, utils
 from fairseq.binarizer import Binarizer
@@ -179,7 +181,7 @@ def main(args):
                 n_seq_tok[0],
                 n_seq_tok[1],
                 100 * sum(replaced.values()) / n_seq_tok[1],
-                vocab.unk_word,
+                vocab.unk_word if isinstance(vocab, BertTokenizer) == False else vocab.unk_token
             )
         )
 
@@ -280,10 +282,19 @@ def main(args):
                 "test.align",
                 num_workers=args.workers,
             )
-
-    make_all(args.source_lang, src_dict)
+    if args.source_bert is not None:
+        config = transformers.BertConfig.from_pretrained(args.source_bert)
+        tokenizer = transformers.BertTokenizer.from_pretrained(args.source_bert, config=config)
+    else:
+        tokenizer = src_dict
+    make_all(args.source_lang, tokenizer)
     if target:
-        make_all(args.target_lang, tgt_dict)
+        if args.target_bert is not None:
+            config = transformers.BertConfig.from_pretrained(args.target_bert)
+            tokenizer = transformers.BertTokenizer.from_pretrained(args.target_bert, config=config)
+        else:
+            tokenizer = tgt_dict
+        make_all(args.target_lang, tokenizer)
     if args.align_suffix:
         make_all_alignments()
 

@@ -153,7 +153,7 @@ class MultiheadAttention(nn.Module):
         assert list(query.size()) == [tgt_len, bsz, embed_dim]
 
         if (
-            not self.onnx_trace
+            False and not self.onnx_trace
             and not self.tpu  # don't use PyTorch version on TPUs
             and incremental_state is None
             and not static_kv

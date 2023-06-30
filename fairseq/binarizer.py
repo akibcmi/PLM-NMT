@@ -5,6 +5,8 @@
 
 import os
 from collections import Counter
+import transformers
+from transformers import BertTokenizer
 
 import torch
 from fairseq.file_io import PathManager
@@ -38,7 +40,10 @@ class Binarizer:
         replaced = Counter()
 
         def replaced_consumer(word, idx):
-            if idx == dict.unk_index and word != dict.unk_word:
+            if isinstance(dict, BertTokenizer):
+                if idx == dict.unk_token_id and word != dict.unk_token:
+                    replaced.update([word])
+            elif idx == dict.unk_index and word != dict.unk_word:
                 replaced.update([word])
 
         with open(PathManager.get_local_path(filename), "r", encoding="utf-8") as f:
@@ -48,7 +53,21 @@ class Binarizer:
             while line:
                 if end > 0 and f.tell() > end:
                     break
-                if already_numberized:
+
+                if isinstance(dict, BertTokenizer):
+                    line = line.strip()
+                    line = '{} {} {}'.format('[CLS]', line, '[SEP]')
+                    tokenizedline = dict.tokenize(line)
+                    if len(tokenizedline) > dict.model_max_length:
+                        tokenizedline = tokenizedline[:dict.model_max_length-1]
+                        tokenizedline.append('[SEP]')
+                    words = dict.convert_tokens_to_ids(tokenizedline)
+                    nwords = len(words)
+                    ids = torch.IntTensor(nwords)
+                    for i, word in enumerate(words):
+                        ids[i] = word
+                        replaced_consumer(tokenizedline[i], word)
+                elif already_numberized:
                     id_strings = line.strip().split()
                     id_list = [int(id_string) for id_string in id_strings]
                     if reverse_order:

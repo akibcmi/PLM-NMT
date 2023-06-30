@@ -8,6 +8,7 @@ import math
 import torch
 from fairseq import metrics, utils
 from fairseq.criterions import FairseqCriterion, register_criterion
+from fairseq.tasks.translation import TranslationBERTTask
 
 
 def label_smoothed_nll_loss(lprobs, target, epsilon, ignore_index=None, reduce=True):
@@ -38,13 +39,15 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
         sentence_avg,
         label_smoothing,
         ignore_prefix_size=0,
-        report_accuracy=False,
+        report_accuracy=False
     ):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.eps = label_smoothing
         self.ignore_prefix_size = ignore_prefix_size
         self.report_accuracy = report_accuracy
+
+        self.alpha=self.task.alpha
 
     @staticmethod
     def add_args(parser):
@@ -105,6 +108,11 @@ class LabelSmoothedCrossEntropyCriterion(FairseqCriterion):
             ignore_index=self.padding_idx,
             reduce=reduce,
         )
+        if net_output[1]["mlmloss"] is not None:
+            loss = loss + net_output[1]["mlmloss"]
+        if net_output[1]["kd_loss"] is not None:
+            loss = loss * (1-self.alpha) +  net_output[1]["kd_loss"] * self.alpha
+
         return loss, nll_loss
 
     def compute_accuracy(self, model, net_output, sample):

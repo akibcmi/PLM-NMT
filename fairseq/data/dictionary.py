@@ -26,15 +26,35 @@ class Dictionary(object):
         eos="</s>",
         unk="<unk>",
         extra_special_symbols=None,
+        bert=None,
+        embed=None
     ):
         self.bos_word, self.unk_word, self.pad_word, self.eos_word = bos, unk, pad, eos
+        self.mak_word = "<mak>"
         self.symbols = []
         self.count = []
         self.indices = {}
-        self.bos_index = self.add_symbol(bos)
-        self.pad_index = self.add_symbol(pad)
-        self.eos_index = self.add_symbol(eos)
-        self.unk_index = self.add_symbol(unk)
+        self.bert = bert
+        self.kwet_dic = embed
+        #if embed is not None:
+        #    self.bert = None
+        #    self.bert_kwet = bert
+        #else:
+        #    self.bert_kwet = None
+
+        if bert is not None and embed is None:
+            self.unk_word, self.pad_word, self.eos_word = bert.unk_token, bert.pad_token, bert.sep_token
+            self.bos_index = bert.cls_token_id
+            self.pad_index = bert.pad_token_id
+            self.eos_index = bert.sep_token_id
+            self.unk_index = bert.unk_token_id
+            self.mak_index = bert.mask_token_id
+        else:
+            self.bos_index = self.add_symbol(bos)
+            self.pad_index = self.add_symbol(pad)
+            self.eos_index = self.add_symbol(eos)
+            self.unk_index = self.add_symbol(unk)
+        self.id2id = {}
         if extra_special_symbols:
             for s in extra_special_symbols:
                 self.add_symbol(s)
@@ -50,6 +70,8 @@ class Dictionary(object):
 
     def __len__(self):
         """Returns the number of symbols in the dictionary"""
+        if self.bert is not None and self.kwet_dic is None:
+            return len(self.bert)
         return len(self.symbols)
 
     def __contains__(self, sym):
@@ -74,6 +96,9 @@ class Dictionary(object):
 
         Can optionally remove BPE symbols or escape <unk> words.
         """
+        if self.bert is not None and self.kwet_dic is None:
+            return self.bert.decode(tensor,skip_special_tokens=True,spaces_between_special_tokens=False)
+
         if torch.is_tensor(tensor) and tensor.dim() == 2:
             return "\n".join(
                 self.string(t, bpe_symbol, escape_unk, extra_symbols_to_ignore)
@@ -200,8 +225,11 @@ class Dictionary(object):
         """Helper to get index of unk symbol"""
         return self.unk_index
 
+    def mak(self):
+        return self.mak_index
+
     @classmethod
-    def load(cls, f):
+    def load(cls, f,bert=None,embed=None):
         """Loads the dictionary from a text file with the format:
 
         ```
@@ -210,7 +238,7 @@ class Dictionary(object):
         ...
         ```
         """
-        d = cls()
+        d = cls(bert=bert,embed=embed)
         d.add_from_file(f)
         return d
 
@@ -258,6 +286,9 @@ class Dictionary(object):
                 raise ValueError(
                     "Incorrect dictionary format, expected '<token> <cnt> [flags]'"
                 )
+
+        if self.kwet_dic is not None:
+            self.mak_index = self.add_symbol(self.mak_word)
 
     def _save(self, f, kv_iterator):
         if isinstance(f, str):

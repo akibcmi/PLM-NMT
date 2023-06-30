@@ -45,13 +45,13 @@ class FairseqTask(object):
         self.dataset_to_epoch_iter = {}
 
     @classmethod
-    def load_dictionary(cls, filename):
+    def load_dictionary(cls, filename,bert=None,embed=None):
         """Load the dictionary from the filename
 
         Args:
             filename (str): the filename
         """
-        return Dictionary.load(filename)
+        return Dictionary.load(filename,bert=bert,embed=embed)
 
     @classmethod
     def build_dictionary(

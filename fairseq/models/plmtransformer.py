@@ -10,6 +10,9 @@ from transformers import AutoConfig
 from transformers import BertPreTrainedModel
 from transformers import BertForMaskedLM
 from transformers import DataCollatorForLanguageModeling
+from fairseq.modules.quant_noise import quant_noise
+
+import torch.nn.functional as F
 
 import torch
 import torch.nn as nn
@@ -31,7 +34,6 @@ from fairseq.modules import (
     SinusoidalPositionalEmbedding,
     TransformerDecoderLayer,
     TransformerEncoderLayer,
-    PLMTransformerDecoderLayer,
     PLMCoordinatorLayer
 )
 from fairseq.modules.quant_noise import quant_noise as apply_quant_noise_
@@ -156,6 +158,11 @@ class PLMTransformerModel(FairseqEncoderDecoderModel):
                             help='the dropout for source plm', default=0.1)
         parser.add_argument("--half-layer-kd", action='store_true',
                             help='if True, use half layer KD')
+        parser.add_argument("--half-layer-kd-tplm", action='store_true')
+        parser.add_argument("--kd-alpha", type=float, default=0.1,metavar='D',
+                            help='the alpha for knowledge distillation')
+        parser.add_argument("--kd-loss",type=str,default='mse',choices=['mse','kl','cosine'], metavar='D',
+                            help='the loss for knowledge distillation, should be one of mse, kl, cosine')
         parser.add_argument("--mlmprob-splm", type=float, metavar='D',
                             help='the probability of MLM for source plm', default=0.1)
         parser.add_argument("--target-plm", type=str, metavar='N',
@@ -165,21 +172,27 @@ class PLMTransformerModel(FairseqEncoderDecoderModel):
         parser.add_argument("--dropout-tplm", type=float, metavar='D',
                             help='the dropout for target plm', default=0.1)
         parser.add_argument("--mlmprob-tplm", type=float, metavar='D',
-                            help='the probability of MLM for target plm', defalut=0.1)
-        parser.add_argument("--embed-splm", action='store_true',metavar='N',
-                            help='if true, use plm embed to initial the embed')
-        parser.add_argument("--embed-tplm", action='store_true',metavar='N',
-                            help='if true, use plm embed to initial the embed')
+                            help='the probability of MLM for target plm', default=0.1)
         parser.add_argument("--adropout-splm", type=float, metavar='D',
                             help='the dropout for self-attention', default=0.1)
         parser.add_argument("--adropout-tplm", type=float, metavar='D',
                             help='the dropout for self-attention', default=0.1)
-        parser.add_argument("--random-splm", action="store_true", metavar='N', )
-        parser.add_argument("--random-tplm", action="store_true", metavar='N', )
-
-
-        parser.add_argument("--layer-number-coordinator", type=int, default=6, metavar='D' )
-        parser.add_argument("--dropout-coord", type=float, default=0.1, metavar='D')
+        parser.add_argument("--random-splm", action='store_true',
+                            help='random source plm')
+        parser.add_argument("--random-tplm", action='store_true',
+                            help='random target plm')
+        parser.add_argument("--fwet", type=str,default=None, metavar='N',
+                            help='use fwet in target')
+        #parser.add_argument("--fwet_splm", type=str, default=None, metavar='N',
+        #                    help='use fwet in source')
+        parser.add_argument("--zero-coord", action="store_true",
+                            help='use embedding instead of output of decoder as the input of coordinator')
+        parser.add_argument("--layer-number-coordinator", type=int, default=6, metavar='D' ,
+                            help='the number of coordinator layers')
+        parser.add_argument("--dropout-coord", type=float, default=0.1, metavar='D',
+                            help='the dropout of coordinator')
+        parser.add_argument("--ffs-splm",action="store_true")
+        parser.add_argument("--ffs-tplm",action="store_true")
         # fmt: on
 
     @classmethod
@@ -220,12 +233,24 @@ class PLMTransformerModel(FairseqEncoderDecoderModel):
             decoder_embed_tokens = encoder_embed_tokens
             args.share_decoder_input_output_embed = True
         else:
-            encoder_embed_tokens = cls.build_embedding(
-                args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
-            )
-            decoder_embed_tokens = cls.build_embedding(
-                args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
-            )
+            if args.source_plm is not None:
+                plmconfig = AutoConfig.from_pretrained(args.source_plm)
+                encoder_embed_tokens = cls.build_embedding(
+                    args, src_dict, plmconfig.hidden_size, args.encoder_embed_path
+                )
+            else:
+                encoder_embed_tokens = cls.build_embedding(
+                    args, src_dict, args.encoder_embed_dim, args.encoder_embed_path
+                )
+            if args.target_plm is not None:
+                plmconfig = AutoConfig.from_pretrained(args.target_plm)
+                decoder_embed_tokens = cls.build_embedding(
+                    args, tgt_dict, plmconfig.hidden_size, args.decoder_embed_path
+                )
+            else:
+                decoder_embed_tokens = cls.build_embedding(
+                    args, tgt_dict, args.decoder_embed_dim, args.decoder_embed_path
+                )
 
         encoder = cls.build_encoder(args, src_dict, encoder_embed_tokens)
         decoder = cls.build_decoder(args, tgt_dict, decoder_embed_tokens)
@@ -323,10 +348,14 @@ class PLMTransformerEncoder(FairseqEncoder):
         self.plmconfig = AutoConfig.from_pretrained(args.source_plm)
         self.plmconfig.attention_probs_dropout_prob = args.adropout_splm
         self.plmconfig.hidden_dropout_prob = args.dropout_splm
-        self.plmencoder = BertForMaskedLM.from_pretrained(args.source_plm, config=self.plmconfig)
+        if args.random_splm:
+            self.plmencoder = BertForMaskedLM(config=self.plmconfig)
+        else:
+            self.plmencoder = BertForMaskedLM.from_pretrained(args.source_plm, config=self.plmconfig)
 
         self.half_layer_kd = args.half_layer_kd
-        self.mlmprob = args.smlmprob
+        self.kd_loss = args.kd_loss
+        self.mlmprob = args.mlmprob_splm
         self.layer_splm = args.layer_number_splm
 
         self.sig = nn.Sequential(nn.Linear(self.plmconfig.hidden_size * 2, self.plmconfig.hidden_size)
@@ -335,10 +364,10 @@ class PLMTransformerEncoder(FairseqEncoder):
 
         if self.mlmprob > 0:
             self.data_fn = DataCollatorForLanguageModeling(
-                tokenizer=dictionary.bert2 if dictionary.bert2 is not None else dictionary.bert,
-                mlm_probability=args.smlmpro)
+                tokenizer=dictionary.bert if dictionary.kwet_dic is not None else dictionary.bert,
+                mlm_probability=args.mlmprob_splm)
         if self.half_layer_kd:
-            self.teacher_bert = BertForMaskedLM.from_pretrained(args.source_bert,config=self.plmconfig)
+            self.teacher_bert = BertForMaskedLM.from_pretrained(args.source_plm,config=self.plmconfig)
             self.teacher_bert.eval()
             self.teacher_bert.requires_grad_(False)
 
@@ -388,11 +417,12 @@ class PLMTransformerEncoder(FairseqEncoder):
                   hidden states of shape `(src_len, batch, embed_dim)`.
                   Only populated if *return_all_hiddens* is True.
         """
+        #src_tokens = src_tokens.transpose(0,1)
         bert_encoder_padding_mask = src_tokens.ne(self.dictionary.pad_index)
         kd_loss=None
         mlmloss= None
         if self.training and self.mlmprob > 0:
-            if self.dictionary.embed is not None:
+            if self.dictionary.kwet_dic is not None:
                 input_ids, labels = self.data_fn.torch_mask_tokens_dic(src_tokens, self.dictionary, special_tokens_mask=None)
             else:
                 input_ids, labels = self.data_fn.torch_mask_tokens(src_tokens, special_tokens_mask=None)
@@ -420,15 +450,23 @@ class PLMTransformerEncoder(FairseqEncoder):
             teacher_out = self.teacher_bert.bert(src_tokens,
                                                  attention_mask=bert_encoder_padding_mask,
                                                  output_hidden_states=True)
-            criterion=nn.MSELoss()
+            if self.kd_loss == 'mse':
+                criterion=nn.MSELoss(reduction='sum')
+                kd_loss = criterion(plm_encoder_out.hidden_states[6], teacher_out.hidden_states[-1].transpose(0,1))
+            elif self.kd_loss == 'kl':
+                criterion = nn.KLDivLoss()
+                kd_loss = criterion(plm_encoder_out.hidden_states[6], teacher_out.hidden_states[-1].transpose(0,1))
+            elif self.kd_loss == 'cosine':
+                criterion = nn.CosineEmbeddingLoss(reduction='mean')
+                kd_loss = criterion(plm_encoder_out.hidden_states[6], teacher_out.hidden_states[-1].transpose(0,1),
+                                    teacher_out.hidden_states[-1].new(teacher_out.hidden_states[-1].size()[0]).fill_(1).int(), reduction='mean')
 
 
-            kd_loss = criterion(plm_encoder_out.hidden_states[6],teacher_out.hidden_states[-1])
 
         return EncoderOut(
             encoder_out=x,  # T x B x C
             encoder_padding_mask=bert_encoder_padding_mask,  # B x T
-            encoder_embedding=plm_encoder_out.hidden_states[0].transpose(1, 0),  # B x T x C
+            encoder_embedding=plm_encoder_out.hidden_states[0],  # B x T x C
             encoder_states=plm_encoder_out.hidden_states,  # List[T x B x C]
             src_tokens=None,
             src_lengths=None,
@@ -470,7 +508,7 @@ class PLMTransformerEncoder(FairseqEncoder):
         new_encoder_embedding = (
             encoder_embedding
             if encoder_embedding is None
-            else encoder_embedding.index_select(0, new_order)
+            else encoder_embedding.index_select(1, new_order)
         )
         src_tokens = encoder_out.src_tokens
         if src_tokens is not None:
@@ -492,6 +530,8 @@ class PLMTransformerEncoder(FairseqEncoder):
             encoder_states=encoder_states,  # List[T x B x C]
             src_tokens=src_tokens,  # B x T
             src_lengths=src_lengths,  # B x 1
+            mlmloss=None,
+            kd_loss=None
         )
 
     def max_positions(self):
@@ -504,19 +544,19 @@ class PLMTransformerEncoder(FairseqEncoder):
 
     def upgrade_state_dict_named(self, state_dict, name):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
-        if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):
-            weights_key = "{}.embed_positions.weights".format(name)
-            if weights_key in state_dict:
-                print("deleting {0}".format(weights_key))
-                del state_dict[weights_key]
-            state_dict[
-                "{}.embed_positions._float_tensor".format(name)
-            ] = torch.FloatTensor(1)
-        for i in range(self.num_layers):
-            # update layer norms
-            self.layers[i].upgrade_state_dict_named(
-                state_dict, "{}.layers.{}".format(name, i)
-            )
+        #if isinstance(self.embed_positions, SinusoidalPositionalEmbedding):
+        #    weights_key = "{}.embed_positions.weights".format(name)
+        #    if weights_key in state_dict:
+        #        print("deleting {0}".format(weights_key))
+        #        del state_dict[weights_key]
+        #    state_dict[
+        #        "{}.embed_positions._float_tensor".format(name)
+        #    ] = torch.FloatTensor(1)
+        #for i in range(self.num_layers):
+        #    # update layer norms
+        #    self.layers[i].upgrade_state_dict_named(
+        #        state_dict, "{}.layers.{}".format(name, i)
+        #    )
 
         version_key = "{}.version".format(name)
         if utils.item(state_dict.get(version_key, torch.Tensor([1]))[0]) < 2:
@@ -554,9 +594,13 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
         self.plmdecoder = BertForMaskedLM.from_pretrained(args.target_plm, config=self.plmconfig)
         self.dictionary = dictionary
 
-        self.mlmprob = args.smlmprob
+        self.mlmprob = args.mlmprob_tplm
         self.layer_tplm = args.layer_number_tplm
+        self.kd_loss = args.kd_loss
         self.layer_coordinator = args.layer_number_coordinator
+        self.ffs_splm = args.ffs_splm
+        self.ffs_tplm = args.ffs_tplm
+        self.zero_coord = args.zero_coord
         self.dropout_coord = FairseqDropout(
             args.dropout_coord, module_name=self.__class__.__name__
         )
@@ -565,9 +609,34 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
         self.sig = nn.Sequential(nn.Linear(self.bert_size *2, self.bert_size),
                                  nn.Sigmoid()
         )
+        self.half_layer_kd = args.half_layer_kd_tplm
         if self.mlmprob > 0:
             self.data_fn = DataCollatorForLanguageModeling(tokenizer=dictionary.bert,
                                              mlm_probability=self.mlmprob)
+        if self.half_layer_kd:
+            self.teacher_bert = BertForMaskedLM.from_pretrained(args.target_bert, config=self.plmconfig)
+            self.teacher_bert.eval()
+            self.teacher_bert.requires_grad_(False)
+        else:
+            self.teacher_bert = None
+
+        self.quant_noise = getattr(args, "quant_noise_pq", 0)
+        self.quant_noise_block_size = getattr(args, "quant_noise_pq_block_size", 8)
+        if self.ffs_splm:
+            self.ffs_s = self.build_ffs(self.plmconfig.hidden_size, self.plmconfig.hidden_size*4, args.decoder_embed_dim,
+                                        self.quant_noise,self.quant_noise_block_size)
+        else:
+            self.ffs_s = Linear(self.plmconfig.hidden_size, args.decoder_embed_dim)
+        if self.ffs_tplm:
+            self.ffs_t = self.build_ffs(self.plmconfig.hidden_size, self.plmconfig.hidden_size*4, args.decoder_embed_dim,
+                                        self.quant_noise,self.quant_noise_block_size)
+            if self.zero_coord:
+                self.ffs_e = self.build_ffs(self.plmconfig.hidden_size, self.plmconfig.hidden_size*4, args.decoder_embed_dim,
+                                        self.quant_noise,self.quant_noise_block_size)
+        else:
+            self.ffs_t = Linear(self.plmconfig.hidden_size, args.decoder_embed_dim)
+            if self.zero_coord:
+                self.ffs_e = Linear(self.plmconfig.hidden_size, args.decoder_embed_dim)
 
         self.dropout_module = FairseqDropout(
             args.dropout, module_name=self.__class__.__name__
@@ -581,7 +650,135 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
         )
         self.share_input_output_embed = args.share_decoder_input_output_embed
 
-        input_embed_dim = embed_tokens.embedding_dim
+        if self.dictionary.bert is not None and self.dictionary.kwet_dic is not None:
+            self.mlm = self.mlmprob > 0
+            if self.dictionary.bert is not None and self.dictionary.kwet_dic is not None:
+                if self.mlm:
+                    bias = nn.Parameter(torch.zeros(len(self.dictionary)))
+                    decoder = nn.Linear(self.plmconfig.hidden_size, len(self.dictionary), bias=False)
+                with open(self.dictionary.kwet_dic, 'r', encoding='utf8') as f1:
+                    for l in f1.readlines():
+                        l = l.strip("\n").strip().split()
+                        word = l[0]
+                        id = self.dictionary.index(word)
+                        ids = []
+                        cous = []
+                        for j in range((int)((len(l) - 1) / 2)):
+                            word = l[2 * j + 1]
+                            idw = self.dictionary.bert._convert_token_to_id(word)
+                            if idw == self.dictionary.bert.unk_token_id:
+                                continue
+                            else:
+                                count = float(l[2 * j + 2])
+                                ids.append(idw)
+                                cous.append(count)
+                        ids = torch.Tensor(ids).long()
+                        cous = torch.Tensor(cous)
+                        cous = nn.functional.softmax(cous, dim=-1)
+                        if args.share_all_embeddings == False:
+                            with torch.no_grad():
+                                idembed = cous.unsqueeze(1) * self.plmdecoder.bert.embeddings.word_embeddings(ids)
+                                idembed = idembed.sum(dim=0)
+                                embed_tokens.weight.data[id,:]= idembed
+                            embed_tokens.requires_grad_(True)
+                        if self.mlm:
+                            with torch.no_grad():
+                                idembed = F.embedding(ids, self.plmdecoder.cls.predictions.decoder.weight)
+                                idbias = F.embedding(ids, self.plmdecoder.cls.predictions.decoder.bias.unsqueeze(1))
+                                idembed = cous.unsqueeze(1) * idembed
+                                idbias = cous.unsqueeze(1) * idbias
+                                decoder.weight.data[id, :] = idembed.sum(dim=0)
+                                bias.data[id] = idbias.sum(dim=0)
+                            decoder.requires_grad_(True)
+                            bias.requires_grad_(True)
+
+                    ids = [self.dictionary.bert.cls_token_id]
+                    ids = torch.Tensor(ids).long()
+                    with torch.no_grad():
+                        idembed = self.plmdecoder.bert.embeddings.word_embeddings(ids)
+                        embed_tokens.weight.data[self.dictionary.bos_index,:] = idembed
+
+                    if self.mlm:
+                        with torch.no_grad():
+                            ids = [self.dictionary.bert.cls_token_id]
+                            ids = torch.Tensor(ids).long()
+                            idembed = F.embedding(ids, self.plmdecoder.cls.predictions.decoder.weight)
+                            idbias = F.embedding(ids, self.plmdecoder.cls.predictions.decoder.bias.unsqueeze(1))
+                            decoder.weight.data[self.dictionary.bos_index, :] = idembed
+                            bias.data[self.dictionary.bos_index] = idbias
+                        decoder.requires_grad_(True)
+                        bias.requires_grad_(True)
+
+                    ids = [self.dictionary.bert.sep_token_id]
+                    ids = torch.Tensor(ids).long()
+                    with torch.no_grad():
+                        idembed = self.plmdecoder.bert.embeddings.word_embeddings(ids)
+                        embed_tokens.weight.data[self.dictionary.eos_index,:] = idembed
+                    if self.mlm:
+                        with torch.no_grad():
+                            ids = [self.dictionary.bert.sep_token_id]
+                            ids = torch.Tensor(ids).long()
+                            idembed = F.embedding(ids,
+                                                  self.plmdecoder.cls.predictions.decoder.weight)
+                            idbias = F.embedding(ids,
+                                                 self.plmdecoder.cls.predictions.decoder.bias.unsqueeze(1))
+                            decoder.weight.data[self.dictionary.eos_index, :] = idembed
+                            bias.data[self.dictionary.eos_index] = idbias
+                        decoder.requires_grad_(True)
+                        bias.requires_grad_(True)
+
+                    ids = [self.dictionary.bert.unk_token_id]
+                    ids = torch.Tensor(ids).long()
+                    with torch.no_grad():
+                        idembed = self.plmdecoder.bert.embeddings.word_embeddings(ids)
+                        embed_tokens.weight.data[self.dictionary.unk_index,:] = idembed
+                    if self.mlm:
+                        with torch.no_grad():
+                            ids = [self.dictionary.bert.unk_token_id]
+                            ids = torch.Tensor(ids).long()
+                            idembed = F.embedding(ids,self.plmdecoder.cls.predictions.decoder.weight)
+                            idbias = F.embedding(ids, self.plmdecoder.cls.predictions.decoder.bias.unsqueeze(1))
+                            decoder.weight.data[self.dictionary.unk_index, :] = idembed
+                            bias.data[self.dictionary.unk_index] = idbias
+                        decoder.requires_grad_(True)
+                        bias.requires_grad_(True)
+
+                    ids = [self.dictionary.bert.mask_token_id]
+                    ids = torch.Tensor(ids).long()
+                    with torch.no_grad():
+                        idembed = self.plmdecoder.bert.embeddings.word_embeddings(ids)
+                        embed_tokens.weight.data[self.dictionary.mak_index,:] = idembed
+
+                    if self.mlm:
+                        with torch.no_grad():
+                            ids = [self.dictionary.bert.mask_token_id]
+                            ids = torch.Tensor(ids).long()
+                            idembed = F.embedding(ids, self.plmdecoder.cls.predictions.decoder.weight)  # )
+                            idbias = F.embedding(ids, self.plmdecoder.cls.predictions.decoder.bias.unsqueeze(1))
+
+                            decoder.weight.data[self.dictionary.mak_index, :] = idembed
+                            bias.data[self.dictionary.mak_index] = idbias
+                        decoder.requires_grad_(True)
+                        bias.requires_grad_(True)
+
+                    embed_tokens.requires_grad_(True)
+
+            self.plmdecoder.bert.embeddings.word_embeddings = embed_tokens
+            if self.mlm:
+                self.plmdecoder.cls.predictions.decoder = decoder
+                self.plmdecoder.cls.predictions.bias = bias
+                self.plmdecoder.cls.predictions.decoder.bias = bias
+
+                if self.teacher_bert is not None:
+                    self.teacher_bert.bert.embeddings.word_embeddings.weight.data = embed_tokens.weight.data.clone()
+                    self.teacher_bert.bert.embeddings.word_embeddings.weight.requires_grad_(False)
+                    self.teacher_bert.bert.embeddings.word_embeddings.requires_grad_(False)
+                    self.teacher_bert.cls.predictions.decoder.weight.data = decoder.weight.data.clone()
+                    self.teacher_bert.cls.predictions.bias.data = bias.data.clone()
+                    self.teacher_bert.cls.predictions.decoder.weight.requires_grad_(False)
+                    self.teacher_bert.cls.predictions.bias.requires_grad_(False)
+
+        input_embed_dim = self.plmconfig.hidden_size
         embed_dim = args.decoder_embed_dim
         self.embed_dim = embed_dim
         self.output_embed_dim = args.decoder_output_dim
@@ -641,23 +838,22 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
 
         self.adaptive_softmax = None
         self.output_projection = None
-        if args.adaptive_softmax_cutoff is not None:
-            self.adaptive_softmax = AdaptiveSoftmax(
-                len(dictionary),
-                self.output_embed_dim,
-                utils.eval_str_list(args.adaptive_softmax_cutoff, type=int),
-                dropout=args.adaptive_softmax_dropout,
-                adaptive_inputs=embed_tokens if args.tie_adaptive_weights else None,
-                factor=args.adaptive_softmax_factor,
-                tie_proj=args.tie_adaptive_proj,
-            )
-        elif self.share_input_output_embed:
-            self.output_projection = nn.Linear(
-                self.embed_tokens.weight.shape[1],
-                self.embed_tokens.weight.shape[0],
-                bias=False,
-            )
+        if self.share_input_output_embed:
+            self.output_share = Linear(self.output_embed_dim, self.embed_tokens.weight.shape[1])
+            self.output_projection = nn.Linear(self.embed_tokens.weight.shape[1], self.embed_tokens.weight.shape[0])
             self.output_projection.weight = self.embed_tokens.weight
+            #self.output_projection = nn.Linear(
+            #    self.embed_tokens.weight.shape[1],
+            #    self.embed_tokens.weight.shape[0],
+            #    bias=False,
+            #)
+            #self.output_projection.weight = self.embed_tokens.weight
+            #embed = self.mlmtarget.bert.embeddings.word_embeddings.weight.clone()
+            #embed.requires_grad_(True)
+
+            #self.embed_tokens = nn.Embedding(embed.size()[0], embed.size()[1], padding_idx=self.padding_idx,
+            #                                 _weight=embed)
+            #self.embed_tokens.requires_grad_(True)
         else:
             self.output_projection = nn.Linear(
                 self.output_embed_dim, len(dictionary), bias=False
@@ -666,11 +862,18 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
                 self.output_projection.weight, mean=0, std=self.output_embed_dim ** -0.5
             )
 
+
+
     def build_decoder_layer(self, args, no_encoder_attn=False):
         return TransformerDecoderLayer(args, no_encoder_attn)
 
     def build_coord_layer(self, args, no_encoder_attn=False):
         return PLMCoordinatorLayer(args, no_encoder_attn)
+
+    def build_ffs(self, input_dim, hidden_dim, output_dim, q_noise, qn_block_size):
+        return nn.Sequential(quant_noise(nn.Linear(input_dim, hidden_dim), q_noise, qn_block_size),
+                             quant_noise(nn.Linear(hidden_dim, output_dim), q_noise, qn_block_size))
+
 
     def forward(
         self,
@@ -782,18 +985,35 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
             prev_output_tokens = prev_output_tokens[:,-1:]
             bert_decoder_padding_mask = prev_token.ne(self.dictionary.pad_index)
         if self.training and self.mlmprob > 0:
-            if self.dictionary.embed is not None:
+            if self.dictionary.kwet_dic is not None:
                 input_ids, label = self.data_fn.torch_mask_tokens_dic(prev_output_tokens, self.dictionary,
                                                                       special_tokens_mask=None)
             else:
                 input_ids, label = self.data_fn.torch_mask_tokens(prev_output_tokens, special_tokens_mask=None)
             bert_unimlm_out = self.plmdecoder(input_ids, labels=label, attention_mask=bert_decoder_padding_mask,
                                               output_hidden_states=True,
-                                              limit=self.tlayer)
+                                              limit=self.layer_tplm)
             mlmloss = bert_unimlm_out.loss
         plm_decoder_out = self.plmdecoder.bert(prev_output_tokens, attention_mask=bert_decoder_padding_mask,
                                 output_hidden_states=True,
-                                limit=self.tlayer,past_key_values=previous_key_value,decoder=True)
+                                limit=self.layer_tplm,past_key_values=previous_key_value,decoder=True)
+        kd_loss = None
+        if self.training and self.half_layer_kd:
+            teacher_out = self.teacher_bert.bert(prev_output_tokens,
+                                                 attention_mask=bert_decoder_padding_mask,
+                                                 output_hidden_states=True)
+            if self.kd_loss == 'mse':
+                criterion = nn.MSELoss(reduction='sum')
+                kd_loss = criterion(plm_decoder_out.hidden_states[6], teacher_out.hidden_states[-1])
+            elif self.kd_loss == 'kl':
+                criterion = nn.KLDivLoss()
+                kd_loss = criterion(plm_decoder_out.hidden_states[6], teacher_out.hidden_states[-1])
+            elif self.kd_loss == 'cosine':
+                criterion = nn.CosineEmbeddingLoss(reduction='mean')
+                kd_loss = criterion(plm_decoder_out.hidden_states[6], teacher_out.hidden_states[-1],
+                                    teacher_out.hidden_states[-1].new(teacher_out.hidden_states[-1].size()[0]).fill_(
+                                        1).int(), reduction='mean')
+
         if incremental_state is not None:
             incremental_state["previous_key_value"] = plm_decoder_out["past_key_values"]
 
@@ -801,6 +1021,10 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
         sigs = self.sig(torch.cat([x, plm_decoder_out.hidden_states[6]],-1))
         x = sigs * x + (1 - sigs ) * plm_decoder_out.hidden_states[6]
         x = x.transpose(0,1)
+        x = self.ffs_t(x)
+        decoder_out = x
+        if self.zero_coord:
+            x_embedding = self.ffs_e(plm_decoder_out.hidden_states[0])
         positions = self.embed_positions(
             prev_token,
             incremental_state=incremental_state,
@@ -808,16 +1032,16 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
         if incremental_state is not None:
             positions = positions[:,-1:]
         if positions is not None:
-            x = x + positions
+            x = x + positions.transpose(0,1)
+
         encoder_state = encoder_out.encoder_out
+        encoder_state = self.ffs_s(encoder_out.encoder_out)
 
         self_attn_padding_mask = prev_output_tokens.eq(self.padding_idx)
 
+        attn: Optional[Tensor] = None
         inner_states = []
         for idx, layer in enumerate(self.layers):
-            if encoder_out is not None:
-                if self.layer_wise_attention:
-                    encoder_state = encoder_out.encoder_states[idx]
             if incremental_state is None and not full_context_alignment:
                 self_attn_mask = self.buffered_future_mask(x)
             else:
@@ -826,16 +1050,20 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
             encoder_padding_mask = encoder_out.encoder_padding_mask if encoder_out is not None else None
             if encoder_padding_mask is not None:
                 encoder_padding_mask = ~encoder_padding_mask
+            if self.zero_coord and idx == 0:
+                input = x_embedding
+            else:
+                input = x
 
-            x, layer_attn = layer(
-                x, encoder_state,
+            x, layer_attn, _ = layer(
+                input, encoder_state,
                 encoder_padding_mask,
                 incremental_state,
                 self_attn_mask=self_attn_mask,
                 self_attn_padding_mask=self_attn_padding_mask,
                 need_attn=bool((idx == alignment_layer)),
                 need_head_weights=bool((idx == alignment_layer)),
-                decoder_out = plm_decoder_out
+                decoder_out = decoder_out
             )
             inner_states.append(x)
             if layer_attn is not None and idx == alignment_layer:
@@ -860,13 +1088,22 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
         elif encoder_out.mlmloss is not None:
             mlmloss = encoder_out.mlmloss
 
-        return x, {"attn": [attn], "inner_states": inner_states, "mlmloss":mlmloss, "kd_loss":encoder_out.kd_loss}
+        if kd_loss is not None and encoder_out.kd_loss is not None:
+            kd_loss = kd_loss + encoder_out.kd_loss
+        elif encoder_out.kd_loss is not None:
+            kd_loss = encoder_out.kd_loss
+
+        return x, {"attn": [attn], "inner_states": inner_states, "mlmloss":mlmloss, "kd_loss":kd_loss}
 
     def output_layer(self, features):
         """Project features to the vocabulary size."""
         if self.adaptive_softmax is None:
             # project back to size of vocabulary
-            return self.output_projection(features)
+            if self.share_input_output_embed:
+                features = self.output_share(features)
+                return self.output_projection(features)
+            else:
+                return self.output_projection(features)
         else:
             return features
 
@@ -912,7 +1149,7 @@ class PLMTransformerDecoder(FairseqIncrementalDecoder):
                 if not self.share_input_output_embed:
                     del state_dict[embed_out_key]
 
-        for i in range(self.num_layers):
+        for i in range(self.layer_coordinator):
             # update layer norms
             layer_norm_map = {
                 "0": "self_attn_layer_norm",
@@ -953,7 +1190,7 @@ def Linear(in_features, out_features, bias=True):
     return m
 
 
-@register_model_architecture("transformer", "transformer")
+@register_model_architecture("plmtransformer", "plmtransformer")
 def base_architecture(args):
     args.encoder_embed_path = getattr(args, "encoder_embed_path", None)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
@@ -997,8 +1234,36 @@ def base_architecture(args):
     args.layernorm_embedding = getattr(args, "layernorm_embedding", False)
     args.tie_adaptive_weights = getattr(args, "tie_adaptive_weights", False)
 
+    args.source_plm = getattr(args, "source_plm", None)
+    args.half_layer_kd = getattr(args, "half_layer_kd", False)
+    args.half_layer_kd_tplm = getattr(args, "half_layer_kd_tplm", False)
+    args.target_plm = getattr(args, "target_plm", None)
+    args.random_splm = getattr(args, "random_splm", False)
+    args.random_tplm = getattr(args, "random_tplm", False)
+    args.zero_coord = getattr(args, "zero_coord", False)
+    args.ffs_splm = getattr(args, "ffs_splm", False)
+    args.ffs_tplm = getattr(args, "ffs_tplm", False)
 
-@register_model_architecture("transformer", "transformer_iwslt_de_en")
+    args.layer_number_splm = getattr(args, "layer_number_splm", 0)
+    args.dropout_splm = getattr(args, "dropout_splm", 0.1)
+    args.mlmprob_splm = getattr(args, "mlmprob_splm", 0.1)
+
+
+    args.layer_number_tplm = getattr(args, "layer_number_tplm", 0)
+    args.dropout_tplm = getattr(args, "dropout_tplm", 0.1)
+    args.mlmprob_tplm = getattr(args, "mlmprob_tplm", 0.1)
+
+    args.adropout_splm = getattr(args, "adropout_splm", 0.1)
+    args.adropout_tplm = getattr(args, "adropout_tplm", 0.1)
+
+    args.layer_number_coordinator = getattr(args, "layer_number_coordinator", 6)
+    args.dropout_coord = getattr(args, "dropout_coord", 0.1)
+
+
+
+
+
+@register_model_architecture("plmtransformer", "plmtransformer_iwslt_de_en")
 def transformer_iwslt_de_en(args):
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 1024)
@@ -1011,13 +1276,13 @@ def transformer_iwslt_de_en(args):
     base_architecture(args)
 
 
-@register_model_architecture("transformer", "transformer_wmt_en_de")
+@register_model_architecture("plmtransformer", "plmtransformer_wmt_en_de")
 def transformer_wmt_en_de(args):
     base_architecture(args)
 
 
 # parameters used in the "Attention Is All You Need" paper (Vaswani et al., 2017)
-@register_model_architecture("transformer", "transformer_vaswani_wmt_en_de_big")
+@register_model_architecture("plmtransformer", "plmtransformer_vaswani_wmt_en_de_big")
 def transformer_vaswani_wmt_en_de_big(args):
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
     args.encoder_ffn_embed_dim = getattr(args, "encoder_ffn_embed_dim", 4096)
@@ -1030,20 +1295,20 @@ def transformer_vaswani_wmt_en_de_big(args):
     base_architecture(args)
 
 
-@register_model_architecture("transformer", "transformer_vaswani_wmt_en_fr_big")
+@register_model_architecture("plmtransformer", "plmtransformer_vaswani_wmt_en_fr_big")
 def transformer_vaswani_wmt_en_fr_big(args):
     args.dropout = getattr(args, "dropout", 0.1)
     transformer_vaswani_wmt_en_de_big(args)
 
 
-@register_model_architecture("transformer", "transformer_wmt_en_de_big")
+@register_model_architecture("plmtransformer", "plmtransformer_wmt_en_de_big")
 def transformer_wmt_en_de_big(args):
     args.attention_dropout = getattr(args, "attention_dropout", 0.1)
     transformer_vaswani_wmt_en_de_big(args)
 
 
 # default parameters used in tensor2tensor implementation
-@register_model_architecture("transformer", "transformer_wmt_en_de_big_t2t")
+@register_model_architecture("plmtransformer", "plmtransformer_wmt_en_de_big_t2t")
 def transformer_wmt_en_de_big_t2t(args):
     args.encoder_normalize_before = getattr(args, "encoder_normalize_before", True)
     args.decoder_normalize_before = getattr(args, "decoder_normalize_before", True)

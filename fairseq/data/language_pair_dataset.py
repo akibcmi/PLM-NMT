@@ -22,20 +22,43 @@ def collate(
     input_feeding=True,
     pad_to_length=None,
     pad_to_multiple=1,
+    tgt_pad=None,
+    tgt_eos=None
 ):
     if len(samples) == 0:
         return {}
 
     def merge(key, left_pad, move_eos_to_beginning=False, pad_to_length=None):
-        return data_utils.collate_tokens(
-            [s[key] for s in samples],
-            pad_idx,
-            eos_idx,
-            left_pad,
-            move_eos_to_beginning,
-            pad_to_length=pad_to_length,
-            pad_to_multiple=pad_to_multiple,
-        )
+        if key =="source":
+            return data_utils.collate_tokens(
+                [s[key] for s in samples],
+                pad_idx,
+                eos_idx,
+                left_pad,
+                move_eos_to_beginning,
+                pad_to_length=pad_to_length,
+                pad_to_multiple=pad_to_multiple,
+            )
+        else:
+            if tgt_pad < 0 or tgt_eos < 0:
+                return data_utils.collate_tokens(
+                    pad_idx,
+                    eos_idx,
+                    left_pad,
+                    move_eos_to_beginning,
+                    pad_to_length=pad_to_length,
+                    pad_to_multiple=pad_to_multiple,
+                )
+            else:
+                return data_utils.collate_tokens(
+                    [s[key] for s in samples],
+                    tgt_pad,
+                    tgt_eos,
+                    left_pad,
+                    move_eos_to_beginning,
+                    pad_to_length=pad_to_length,
+                    pad_to_multiple=pad_to_multiple
+                )
 
     def check_alignment(alignment, src_len, tgt_len):
         if alignment is None or len(alignment) == 0:
@@ -228,9 +251,10 @@ class LanguagePairDataset(FairseqDataset):
         pad_to_multiple=1,
     ):
         if tgt_dict is not None:
-            assert src_dict.pad() == tgt_dict.pad()
-            assert src_dict.eos() == tgt_dict.eos()
-            assert src_dict.unk() == tgt_dict.unk()
+            if src_dict.bert is None and tgt_dict.bert is None:
+                assert src_dict.pad() == tgt_dict.pad()
+                assert src_dict.eos() == tgt_dict.eos()
+                assert src_dict.unk() == tgt_dict.unk()
         if tgt is not None:
             assert len(src) == len(
                 tgt
@@ -386,6 +410,8 @@ class LanguagePairDataset(FairseqDataset):
             input_feeding=self.input_feeding,
             pad_to_length=pad_to_length,
             pad_to_multiple=self.pad_to_multiple,
+            tgt_pad=self.tgt_dict.pad(),
+            tgt_eos=self.tgt_dict.eos()
         )
         if self.src_lang_id is not None or self.tgt_lang_id is not None:
             src_tokens = res["net_input"]["src_tokens"]

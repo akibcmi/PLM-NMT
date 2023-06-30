@@ -47,6 +47,8 @@ def get_generation_parser(interactive=False, default_task="translation"):
     add_generation_args(parser)
     if interactive:
         add_interactive_args(parser)
+    parser.add_argument("--source-plm",type=str)
+    parser.add_argument("--target-plm",type=str)
     return parser
 
 
@@ -277,6 +279,10 @@ def add_preprocess_args(parser):
                        help="Pad dictionary size to be multiple of N")
     group.add_argument("--workers", metavar="N", default=1, type=int,
                        help="number of parallel workers")
+    group.add_argument("--source-bert",type=str,default=None)
+    group.add_argument("--target-bert",type=str,default=None)
+
+
     # fmt: on
     return parser
 
@@ -408,6 +414,9 @@ def add_generation_args(parser):
 
     # special decoding format for advanced decoding.
     group.add_argument('--decoding-format', default=None, type=str, choices=['unigram', 'ensemble', 'vote', 'dp', 'bs'])
+
+    parser.add_argument("--fwet", type=str, default=None, metavar='N',
+                        help='use fwet in target')
     # fmt: on
     return group
 
